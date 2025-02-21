@@ -14,18 +14,19 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 - [Rust](https://www.rust-lang.org/tools/install) (stable, with Cargo)
 - [PM2](https://pm2.keymetrics.io/) (optional, for process management)
 - A configured `frontends.json` file containing an array of server objects:
+  
   ```json
   [
       { "name": "Server1", "ip": "192.168.1.100" },
       { "name": "Server2", "ip": "192.168.1.101" }
   ]
-```
+  ```
 
 ## Installation
 
 ```
 # Clone the Repository:
-git clone https://github.com/yourusername/rust-server-monitor.git
+git clone git@github.com:L0rdT33z/rust-server-monitor.git
 cd rust-server-monitor
 
 # Build the Project in Release Mode:
@@ -52,11 +53,34 @@ cargo build --release
 
 PM2 is a process manager that can help you keep the application running continuously, including automatically restarting it on server startup.
 
+    
+0. **Install NodeJS & NPM:**
+   
+   ```bash
+   sudo su -
+   cd ~
+   curl -sL https://deb.nodesource.com/setup_16.x -o /tmp/nodesource_setup.sh
+   sudo bash /tmp/nodesource_setup.sh
+   sudo apt install nodejs
+   ```
+    
+
 1. **Install PM2 Globally:**
    
    ```bash
    npm install -g pm2
    ```
+
+2. **Clone the Repository:**
+```
+# Clone the Repository:
+   git clone git@github.com:L0rdT33z/rust-server-monitor.git
+   cd rust-server-monitor
+
+# Build the Project in Release Mode:
+   cargo build --release
+```
+
 
 2. **Start Your Rust Application with PM2:**
    
