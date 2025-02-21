@@ -27,7 +27,7 @@ struct SystemMetrics {
     memory_percent: f64,
 }
 
-#[get("/diskusage")]
+#[get("/usage")]
 async fn get_disk_usage() -> impl Responder {
     let mut sys = System::new_all();
     sys.refresh_all();

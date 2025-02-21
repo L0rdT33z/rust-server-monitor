@@ -10,6 +10,7 @@ use std::{
 };
 use tokio::time;
 use futures::stream::{self, StreamExt};
+use chrono::{Utc, FixedOffset};
 
 const FRONTENDS_FILE: &str = "frontends.json";
 
@@ -79,7 +80,7 @@ struct ComputedMemoryUsage {
     status: String, // "red" if memory_percent > 70, else "green"
 }
 
-// ServerUsage now includes memory usage and status fields.
+// ServerUsage now includes memory usage, status fields, and crawl_time.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerUsage {
     frontend: FrontendInfo,
@@ -91,6 +92,7 @@ struct ServerUsage {
     cpu_status: String,     // "red" if global CPU usage > 70, else "green"
     memory_status: String,  // "red" if memory usage > 70, else "green"
     overall_status: String, // "red" if any of the statuses is red, else "green"
+    crawl_time: String,     // crawl time in Thailand time (UTC+7)
 }
 
 // Global in‑memory storage.
@@ -185,6 +187,32 @@ async fn index() -> impl Responder {
     // Global object to hold each server's expanded state.
     window.expandedStates = {};
 
+    // Helper function to compute relative time from a crawl_time string.
+    function computeTimeDisplay(crawlTimeString) {
+      let crawlTimeISO = crawlTimeString.replace(" ", "T");
+      let crawlTime = new Date(crawlTimeISO);
+      let now = new Date();
+      let diffMs = now - crawlTime;
+      let diffSeconds = Math.floor(diffMs / 1000);
+      if (diffSeconds == 0) {
+        return "(Just now)";
+      } else {
+        return `(${diffSeconds} seconds ago)`;
+      }
+    }
+
+    // Function to update all relative time displays.
+    function updateAllRelativeTimes() {
+      let timeDisplays = document.getElementsByClassName('time-display');
+      for (let td of timeDisplays) {
+        let crawlTime = td.getAttribute('data-crawl-time');
+        td.textContent = computeTimeDisplay(crawlTime);
+      }
+    }
+
+    // Update the relative times every second.
+    setInterval(updateAllRelativeTimes, 1000);
+
     function showAlert(message, type = 'success') {
       const alertContainer = document.getElementById('alert-container');
       const alertDiv = document.createElement('div');
@@ -220,7 +248,15 @@ async fn index() -> impl Responder {
         headerDiv.className = 'server-header';
         const infoSpan = document.createElement('span');
         infoSpan.className = 'server-info';
+        // Static part: server name and IP.
         infoSpan.textContent = `${frontend.name} (IP: ${frontend.ip})`;
+        // Create a span to hold the relative time.
+        let timeSpan = document.createElement('span');
+        timeSpan.className = 'time-display';
+        timeSpan.setAttribute('data-crawl-time', srv.crawl_time);
+        timeSpan.style.marginLeft = "10px";
+        timeSpan.textContent = computeTimeDisplay(srv.crawl_time);
+        infoSpan.appendChild(timeSpan);
         infoSpan.style.cursor = 'pointer';
         headerDiv.appendChild(infoSpan);
         
@@ -244,7 +280,7 @@ async fn index() -> impl Responder {
         const overallIcon = overallStatus === 'green'
           ? '<span class="green">&#x2714;</span>'
           : '<span class="red">&#x26A0;</span>';
-        overallSpan.innerHTML = ` [Overall: ${overallIcon}]`;
+        overallSpan.innerHTML = `[Overall: ${overallIcon}]`;
         statusContainer.appendChild(overallSpan);
         headerDiv.appendChild(statusContainer);
         serverDiv.appendChild(headerDiv);
@@ -442,6 +478,8 @@ async fn index() -> impl Responder {
           })
         });
         if (res.ok) {
+          // Clear the form inputs after successful addition.
+          document.getElementById('add-frontend-form').reset();
           const modalEl = document.getElementById('addFrontendModal');
           const modal = bootstrap.Modal.getInstance(modalEl);
           modal.hide();
@@ -517,17 +555,21 @@ async fn poll_frontends() {
     loop {
         let frontends = FRONTENDS.read().unwrap().clone();
 
-        // Process each frontend concurrently with a concurrency limit.
         let new_usage_data: Vec<ServerUsage> = stream::iter(frontends.into_iter())
             .map(|fe| {
                 let client = client.clone();
                 async move {
-                    let url = format!("http://{}:8081/diskusage", fe.ip);
+                    // Get current time in Thailand (UTC+7)
+                    let crawl_time = Utc::now()
+                        .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap())
+                        .format("%Y-%m-%d %H:%M:%S")
+                        .to_string();
+
+                    let url = format!("http://{}:8081/usage", fe.ip);
                     let usage = match client.get(&url).send().await {
                         Ok(resp) if resp.status().is_success() => {
                             match resp.json::<SystemMetrics>().await {
                                 Ok(metrics) => {
-                                    // Compute per-disk statuses.
                                     let computed_disks: Vec<ComputedDiskUsage> =
                                         metrics.disk_usage.into_iter().map(|d| {
                                             ComputedDiskUsage {
@@ -542,7 +584,6 @@ async fn poll_frontends() {
                                                 },
                                             }
                                         }).collect();
-                                    // Compute per-CPU statuses.
                                     let computed_cpus: Vec<ComputedCpuInfo> =
                                         metrics.cpus.into_iter().map(|c| {
                                             ComputedCpuInfo {
@@ -556,7 +597,6 @@ async fn poll_frontends() {
                                                 },
                                             }
                                         }).collect();
-                                    // Compute memory usage.
                                     let computed_memory = ComputedMemoryUsage {
                                         total_memory: metrics.total_memory,
                                         used_memory: metrics.used_memory,
@@ -567,7 +607,6 @@ async fn poll_frontends() {
                                             "green".to_string()
                                         },
                                     };
-                                    // Global statuses.
                                     let disk_status = if computed_disks.iter().any(|d| d.status == "red") {
                                         "red"
                                     } else {
@@ -594,6 +633,7 @@ async fn poll_frontends() {
                                         cpu_status,
                                         memory_status,
                                         overall_status,
+                                        crawl_time: crawl_time.clone(),
                                     }
                                 },
                                 Err(err) => {
@@ -608,6 +648,7 @@ async fn poll_frontends() {
                                         cpu_status: "red".to_string(),
                                         memory_status: "red".to_string(),
                                         overall_status: "red".to_string(),
+                                        crawl_time: crawl_time.clone(),
                                     }
                                 }
                             }
@@ -624,6 +665,7 @@ async fn poll_frontends() {
                                 cpu_status: "red".to_string(),
                                 memory_status: "red".to_string(),
                                 overall_status: "red".to_string(),
+                                crawl_time: crawl_time.clone(),
                             }
                         },
                         _ => ServerUsage {
@@ -636,13 +678,13 @@ async fn poll_frontends() {
                             cpu_status: "red".to_string(),
                             memory_status: "red".to_string(),
                             overall_status: "red".to_string(),
+                            crawl_time: crawl_time.clone(),
                         }
                     };
                     usage
                 }
             })
-            // Limit the number of concurrent requests (e.g., 100 at a time).
-            .buffer_unordered(100)
+            .buffered(100)
             .collect()
             .await;
 
