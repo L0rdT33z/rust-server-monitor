@@ -1,6 +1,3 @@
-Below is an updated version of your `README.md` file that includes instructions on how to configure PM2 to run your Rust application on server startup.
-
-```markdown
 # rust-server-monitor
 
 A high-performance server monitoring tool written in Rust using Actix-web. It concurrently polls multiple frontend servers to collect system metrics (disk, CPU, memory) and provides a real-time dashboard for monitoring.
