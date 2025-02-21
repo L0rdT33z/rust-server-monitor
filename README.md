@@ -25,7 +25,7 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 
 ```
 # Clone the Repository:
-git clone https://github.com/yourusername/rust-server-monitor.git
+git clone git@github.com:L0rdT33z/rust-server-monitor.git
 cd rust-server-monitor
 
 # Build the Project in Release Mode:
