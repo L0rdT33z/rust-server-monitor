@@ -3,6 +3,7 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::HashMap,
     env,
     fs::File,
     io::{Read, Write},
@@ -21,15 +22,16 @@ const FRONTENDS_FILE: &str = "frontends.json";
 struct FrontendInfo {
     name: String,
     ip: String,
+    #[serde(rename = "type")]
+    frontend_type: String, // "server" or "website"
 }
 
-// For deletion, we only need the name.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DeleteFrontend {
     name: String,
 }
 
-// These types come from the frontend agent.
+// Types from the frontend agent.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct DiskUsage {
     mount_point: String,
@@ -45,7 +47,6 @@ struct CpuInfo {
     frequency: u64,
 }
 
-// Updated SystemMetrics now includes memory information.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct SystemMetrics {
     disk_usage: Vec<DiskUsage>,
@@ -56,7 +57,7 @@ struct SystemMetrics {
     memory_percent: f64,
 }
 
-// Computed types defined only once.
+// Computed types.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ComputedDiskUsage {
     mount_point: String,
@@ -74,16 +75,22 @@ struct ComputedCpuInfo {
     status: String, // "red" if cpu_usage > 90, else "green"
 }
 
-// New computed type for memory usage.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ComputedMemoryUsage {
     total_memory: u64,
     used_memory: u64,
     memory_percent: f64,
-    status: String, // "red" if memory_percent > 70, else "green"
+    status: String, // "red" if memory_percent > 90, else "green"
 }
 
-// ServerUsage now includes memory usage, status fields, and crawl_time.
+// For website status history.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct StatusRecord {
+    status_code: u16,
+    crawl_time: String,
+}
+
+// ServerUsage now includes a connectivity field.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct ServerUsage {
     frontend: FrontendInfo,
@@ -93,9 +100,11 @@ struct ServerUsage {
     memory_usage: Option<ComputedMemoryUsage>,
     disk_status: String,    // "red" if any disk is red, else "green"
     cpu_status: String,     // "red" if global CPU usage > 90, else "green"
-    memory_status: String,  // "red" if memory usage > 70, else "green"
+    memory_status: String,  // "red" if memory usage > 90, else "green"
     overall_status: String, // "red" if any of the statuses is red, else "green"
+    connectivity: String,   // "green" if reachable, "red" otherwise
     crawl_time: String,     // crawl time in Thailand time (UTC+7)
+    status_history: Option<Vec<StatusRecord>>, // Only for website type
 }
 
 // Global in‑memory storage.
@@ -104,8 +113,9 @@ static FRONTENDS: Lazy<RwLock<Vec<FrontendInfo>>> = Lazy::new(|| {
     RwLock::new(frontends)
 });
 static USAGE_DATA: Lazy<RwLock<Vec<ServerUsage>>> = Lazy::new(|| RwLock::new(vec![]));
+static WEBSITE_HISTORY: Lazy<RwLock<HashMap<String, Vec<StatusRecord>>>> =
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
-// Global environment variables for Slack.
 static SLACK_WEBHOOK: Lazy<Option<String>> = Lazy::new(|| {
     env::var("SLACK_WEBHOOK").ok()
 });
@@ -136,7 +146,7 @@ async fn api_servers() -> impl Responder {
 
 #[get("/")]
 async fn index() -> impl Responder {
-    // The HTML uses Bootstrap 5.
+    // The HTML page remains unchanged.
     let html = r#"<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -180,8 +190,15 @@ async fn index() -> impl Responder {
               <input type="text" class="form-control" id="frontendName" name="name" required>
             </div>
             <div class="mb-3">
-              <label for="frontendIP" class="form-label">Frontend IP</label>
+              <label for="frontendIP" class="form-label">IP/Address</label>
               <input type="text" class="form-control" id="frontendIP" name="ip" required>
+            </div>
+            <div class="mb-3">
+              <label for="frontendType" class="form-label">Type</label>
+              <select class="form-select" id="frontendType" name="type" required>
+                <option value="server">Server</option>
+                <option value="website">Website</option>
+              </select>
             </div>
           </div>
           <div class="modal-footer">
@@ -195,24 +212,17 @@ async fn index() -> impl Responder {
 
   <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
   <script>
-    // Global object to hold each server's expanded state.
+    // Global object for expanded states.
     window.expandedStates = {};
 
-    // Helper function to compute relative time from a crawl_time string.
     function computeTimeDisplay(crawlTimeString) {
       let crawlTimeISO = crawlTimeString.replace(" ", "T");
       let crawlTime = new Date(crawlTimeISO);
       let now = new Date();
-      let diffMs = now - crawlTime;
-      let diffSeconds = Math.floor(diffMs / 1000);
-      if (diffSeconds == 0) {
-        return "(Just now)";
-      } else {
-        return `(${diffSeconds} seconds ago)`;
-      }
+      let diffSeconds = Math.floor((now - crawlTime) / 1000);
+      return diffSeconds === 0 ? "(Just now)" : `(${diffSeconds} seconds ago)`;
     }
 
-    // Function to update all relative time displays.
     function updateAllRelativeTimes() {
       let timeDisplays = document.getElementsByClassName('time-display');
       for (let td of timeDisplays) {
@@ -220,8 +230,6 @@ async fn index() -> impl Responder {
         td.textContent = computeTimeDisplay(crawlTime);
       }
     }
-
-    // Update the relative times every second.
     setInterval(updateAllRelativeTimes, 1000);
 
     function showAlert(message, type = 'success') {
@@ -244,24 +252,19 @@ async fn index() -> impl Responder {
       const container = document.getElementById('servers');
       container.innerHTML = '';
       serversData.forEach(srv => {
-        const { frontend, disk_usage } = srv;
-        const connectivity = srv.disk_usage ? 'green' : 'red';
+        const frontend = srv.frontend;
+        const isWebsite = frontend.type.toLowerCase() === "website";
+        const connectivity = srv.connectivity;
         const overallStatus = srv.overall_status;
-        const diskStatus = srv.disk_status;
-        const cpuStatus = srv.cpu_status;
-        const memoryStatus = srv.memory_status;
-        
         const serverDiv = document.createElement('div');
         serverDiv.className = 'server-container';
-        
-        // Header.
+
+        // Header
         const headerDiv = document.createElement('div');
         headerDiv.className = 'server-header';
         const infoSpan = document.createElement('span');
         infoSpan.className = 'server-info';
-        // Static part: server name and IP.
-        infoSpan.textContent = `${frontend.name} (IP: ${frontend.ip})`;
-        // Create a span to hold the relative time.
+        infoSpan.innerHTML = `${frontend.name} (IP/Address: ${frontend.ip})`;
         let timeSpan = document.createElement('span');
         timeSpan.className = 'time-display';
         timeSpan.setAttribute('data-crawl-time', srv.crawl_time);
@@ -270,7 +273,7 @@ async fn index() -> impl Responder {
         infoSpan.appendChild(timeSpan);
         infoSpan.style.cursor = 'pointer';
         headerDiv.appendChild(infoSpan);
-        
+
         const deleteBtn = document.createElement('button');
         deleteBtn.className = 'btn btn-sm btn-danger';
         deleteBtn.textContent = 'Delete';
@@ -280,11 +283,11 @@ async fn index() -> impl Responder {
           }
         });
         headerDiv.appendChild(deleteBtn);
-        
+
         const statusContainer = document.createElement('span');
         const connectivitySpan = document.createElement('span');
         connectivitySpan.className = `status-label ${connectivity}`;
-        connectivitySpan.textContent = `[Connectivity: ${connectivity === 'green' ? 'OK' : 'Down'}]`;
+        connectivitySpan.innerHTML = `[Connectivity: ${connectivity === 'green' ? 'OK' : 'Down'}]`;
         statusContainer.appendChild(connectivitySpan);
         const overallSpan = document.createElement('span');
         overallSpan.className = `status-label ${overallStatus}`;
@@ -295,13 +298,11 @@ async fn index() -> impl Responder {
         statusContainer.appendChild(overallSpan);
         headerDiv.appendChild(statusContainer);
         serverDiv.appendChild(headerDiv);
-        
+
         // Tab group container.
         const tabGroup = document.createElement('div');
         tabGroup.className = 'tab-group';
         tabGroup.style.display = (window.expandedStates[frontend.name] && window.expandedStates[frontend.name] !== "") ? 'block' : 'none';
-
-        // Toggle tabGroup display when clicking on the header.
         infoSpan.addEventListener('click', () => {
           if (tabGroup.style.display === 'none') {
             tabGroup.style.display = 'block';
@@ -313,159 +314,208 @@ async fn index() -> impl Responder {
             window.expandedStates[frontend.name] = '';
           }
         });
-        
-        // Disk Usage tab-item.
-        const diskTabItem = document.createElement('div');
-        diskTabItem.className = 'tab-item';
-        const diskTab = document.createElement('div');
-        diskTab.className = 'tab';
-        const diskTabIcon = diskStatus === 'red'
-          ? '<span class="red">&#x26A0;</span>'
-          : '<span class="green">&#x2714;</span>';
-        diskTab.innerHTML = `Disk Usage ${diskTabIcon}`;
-        diskTab.addEventListener('click', () => {
-          if (window.expandedStates[frontend.name] === 'disk') {
-            window.expandedStates[frontend.name] = 'open';
-            diskContent.style.display = 'none';
-          } else {
-            window.expandedStates[frontend.name] = 'disk';
-            diskContent.style.display = 'block';
-            cpuContent.style.display = 'none';
-            memoryContent.style.display = 'none';
-          }
-        });
-        diskTabItem.appendChild(diskTab);
-        const diskContent = document.createElement('div');
-        diskContent.id = `disk-content-${frontend.name}`;
-        diskContent.className = 'tab-content';
-        if (disk_usage) {
-          let tableHtml = `<table class="table table-striped">
-            <thead>
-              <tr>
-                <th>Mount Point</th>
-                <th>Total (bytes)</th>
-                <th>Used (bytes)</th>
-                <th>Usage %</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>`;
-          disk_usage.forEach(disk => {
-            tableHtml += `<tr>
-              <td>${disk.mount_point}</td>
-              <td>${disk.total}</td>
-              <td>${disk.used}</td>
-              <td>${disk.used_percent.toFixed(2)}%</td>
-              <td><span class="text-${disk.status}">${disk.status === 'red' ? '&#x26A0;' : '&#x2714;'}</span></td>
-            </tr>`;
+
+        if (isWebsite) {
+          // Website: show Status History tab.
+          const statusTabItem = document.createElement('div');
+          statusTabItem.className = 'tab-item';
+          const statusTab = document.createElement('div');
+          statusTab.className = 'tab';
+          const statusTabIcon = overallStatus === 'red'
+            ? '<span class="red">&#x26A0;</span>'
+            : '<span class="green">&#x2714;</span>';
+          statusTab.innerHTML = `Status History ${statusTabIcon}`;
+          statusTab.addEventListener('click', () => {
+            if (window.expandedStates[frontend.name] === 'status') {
+              window.expandedStates[frontend.name] = 'open';
+              statusContent.style.display = 'none';
+            } else {
+              window.expandedStates[frontend.name] = 'status';
+              statusContent.style.display = 'block';
+            }
           });
-          tableHtml += `</tbody></table>`;
-          diskContent.innerHTML = tableHtml;
-        } else {
-          diskContent.innerHTML = `<p class="text-danger">Unable to retrieve disk usage data.</p>`;
-        }
-        diskContent.style.display = (window.expandedStates[frontend.name] === 'disk') ? 'block' : 'none';
-        diskTabItem.appendChild(diskContent);
-        tabGroup.appendChild(diskTabItem);
-        
-        // CPU Usage tab-item.
-        const cpuTabItem = document.createElement('div');
-        cpuTabItem.className = 'tab-item';
-        const cpuTab = document.createElement('div');
-        cpuTab.className = 'tab';
-        const cpuTabIcon = cpuStatus === 'red'
-          ? '<span class="red">&#x26A0;</span>'
-          : '<span class="green">&#x2714;</span>';
-        cpuTab.innerHTML = `CPU Usage ${cpuTabIcon}`;
-        cpuTab.addEventListener('click', () => {
-          if (window.expandedStates[frontend.name] === 'cpu') {
-            window.expandedStates[frontend.name] = 'open';
-            cpuContent.style.display = 'none';
+          statusTabItem.appendChild(statusTab);
+          const statusContent = document.createElement('div');
+          statusContent.id = `status-content-${frontend.name}`;
+          statusContent.className = 'tab-content';
+          if (srv.status_history && srv.status_history.length > 0) {
+            let tableHtml = `<table class="table table-striped">
+              <thead>
+                <tr>
+                  <th>Status Code</th>
+                  <th>Crawl Time</th>
+                </tr>
+              </thead>
+              <tbody>`;
+            srv.status_history.forEach(record => {
+              const codeIcon = record.status_code == 200
+                ? '<span class="green">&#x2714;</span>'
+                : '<span class="red">&#x26A0;</span>';
+              tableHtml += `<tr>
+                <td>${record.status_code} ${codeIcon}</td>
+                <td>${record.crawl_time}</td>
+              </tr>`;
+            });
+            tableHtml += `</tbody></table>`;
+            statusContent.innerHTML = tableHtml;
           } else {
-            window.expandedStates[frontend.name] = 'cpu';
-            cpuContent.style.display = 'block';
-            diskContent.style.display = 'none';
-            memoryContent.style.display = 'none';
+            statusContent.innerHTML = `<p class="text-danger">No status history available.</p>`;
           }
-        });
-        cpuTabItem.appendChild(cpuTab);
-        const cpuContent = document.createElement('div');
-        cpuContent.id = `cpu-content-${frontend.name}`;
-        cpuContent.className = 'tab-content';
-        let cpuHtml = "";
-        if (srv.cpu_usage != null) {
-          cpuHtml += `<p>Global CPU Usage: ${srv.cpu_usage.toFixed(2)}%</p>`;
-        }
-        if (srv.cpus && srv.cpus.length > 0) {
-          cpuHtml += `<table class="table table-striped">
-            <thead>
-              <tr>
-                <th>CPU Core</th>
-                <th>Usage (%)</th>
-                <th>Frequency (MHz)</th>
-                <th>Status</th>
-              </tr>
-            </thead>
-            <tbody>`;
-          srv.cpus.forEach(cpu => {
-            cpuHtml += `<tr>
-              <td>${cpu.name}</td>
-              <td>${cpu.cpu_usage.toFixed(2)}</td>
-              <td>${cpu.frequency}</td>
-              <td><span class="text-${cpu.status}">${cpu.status === 'red' ? '&#x26A0;' : '&#x2714;'}</span></td>
-            </tr>`;
+          statusContent.style.display = (window.expandedStates[frontend.name] === 'status') ? 'block' : 'none';
+          statusTabItem.appendChild(statusContent);
+          tabGroup.appendChild(statusTabItem);
+        } else {
+          // Server: show Disk, CPU, and Memory tabs.
+          const diskTabItem = document.createElement('div');
+          diskTabItem.className = 'tab-item';
+          const diskTab = document.createElement('div');
+          diskTab.className = 'tab';
+          const diskTabIcon = srv.disk_status === 'red'
+            ? '<span class="red">&#x26A0;</span>'
+            : '<span class="green">&#x2714;</span>';
+          diskTab.innerHTML = `Disk Usage ${diskTabIcon}`;
+          diskTab.addEventListener('click', () => {
+            if (window.expandedStates[frontend.name] === 'disk') {
+              window.expandedStates[frontend.name] = 'open';
+              diskContent.style.display = 'none';
+            } else {
+              window.expandedStates[frontend.name] = 'disk';
+              diskContent.style.display = 'block';
+              cpuContent.style.display = 'none';
+              memoryContent.style.display = 'none';
+            }
           });
-          cpuHtml += `</tbody></table>`;
-        } else {
-          cpuHtml += `<p class="text-danger">Unable to retrieve CPU usage data.</p>`;
-        }
-        cpuContent.innerHTML = cpuHtml;
-        cpuContent.style.display = (window.expandedStates[frontend.name] === 'cpu') ? 'block' : 'none';
-        cpuTabItem.appendChild(cpuContent);
-        tabGroup.appendChild(cpuTabItem);
-        
-        // Memory Usage tab-item.
-        const memoryTabItem = document.createElement('div');
-        memoryTabItem.className = 'tab-item';
-        const memoryTab = document.createElement('div');
-        memoryTab.className = 'tab';
-        const memoryTabIcon = memoryStatus === 'red'
-          ? '<span class="red">&#x26A0;</span>'
-          : '<span class="green">&#x2714;</span>';
-        memoryTab.innerHTML = `Memory Usage ${memoryTabIcon}`;
-        memoryTab.addEventListener('click', () => {
-          if (window.expandedStates[frontend.name] === 'memory') {
-            window.expandedStates[frontend.name] = 'open';
-            memoryContent.style.display = 'none';
+          diskTabItem.appendChild(diskTab);
+          const diskContent = document.createElement('div');
+          diskContent.id = `disk-content-${frontend.name}`;
+          diskContent.className = 'tab-content';
+          if (srv.disk_usage) {
+            let tableHtml = `<table class="table table-striped">
+              <thead>
+                <tr>
+                  <th>Mount Point</th>
+                  <th>Total (bytes)</th>
+                  <th>Used (bytes)</th>
+                  <th>Usage %</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>`;
+            srv.disk_usage.forEach(disk => {
+              tableHtml += `<tr>
+                <td>${disk.mount_point}</td>
+                <td>${disk.total}</td>
+                <td>${disk.used}</td>
+                <td>${disk.used_percent.toFixed(2)}%</td>
+                <td><span class="text-${disk.status}">${disk.status == "red" ? "&#x26A0;" : "&#x2714;"}</span></td>
+              </tr>`;
+            });
+            tableHtml += `</tbody></table>`;
+            diskContent.innerHTML = tableHtml;
           } else {
-            window.expandedStates[frontend.name] = 'memory';
-            memoryContent.style.display = 'block';
-            diskContent.style.display = 'none';
-            cpuContent.style.display = 'none';
+            diskContent.innerHTML = `<p class="text-danger">Unable to retrieve disk usage data.</p>`;
           }
-        });
-        memoryTabItem.appendChild(memoryTab);
-        const memoryContent = document.createElement('div');
-        memoryContent.id = `memory-content-${frontend.name}`;
-        memoryContent.className = 'tab-content';
-        let memoryHtml = "";
-        if (srv.memory_usage) {
-          memoryHtml += `<p>Total Memory: ${srv.memory_usage.total_memory}</p>`;
-          memoryHtml += `<p>Used Memory: ${srv.memory_usage.used_memory}</p>`;
-          memoryHtml += `<p>Usage: ${srv.memory_usage.memory_percent.toFixed(2)}%</p>`;
-        } else {
-          memoryHtml += `<p class="text-danger">Unable to retrieve memory usage data.</p>`;
+          diskContent.style.display = (window.expandedStates[frontend.name] === 'disk') ? 'block' : 'none';
+          diskTabItem.appendChild(diskContent);
+          tabGroup.appendChild(diskTabItem);
+          
+          const cpuTabItem = document.createElement('div');
+          cpuTabItem.className = 'tab-item';
+          const cpuTab = document.createElement('div');
+          cpuTab.className = 'tab';
+          const cpuTabIcon = srv.cpu_status === 'red'
+            ? '<span class="red">&#x26A0;</span>'
+            : '<span class="green">&#x2714;</span>';
+          cpuTab.innerHTML = `CPU Usage ${cpuTabIcon}`;
+          cpuTab.addEventListener('click', () => {
+            if (window.expandedStates[frontend.name] === 'cpu') {
+              window.expandedStates[frontend.name] = 'open';
+              cpuContent.style.display = 'none';
+            } else {
+              window.expandedStates[frontend.name] = 'cpu';
+              cpuContent.style.display = 'block';
+              diskContent.style.display = 'none';
+              memoryContent.style.display = 'none';
+            }
+          });
+          cpuTabItem.appendChild(cpuTab);
+          const cpuContent = document.createElement('div');
+          cpuContent.id = `cpu-content-${frontend.name}`;
+          cpuContent.className = 'tab-content';
+          let cpuHtml = "";
+          if (srv.cpu_usage != null) {
+            cpuHtml += `<p>Global CPU Usage: ${srv.cpu_usage.toFixed(2)}%</p>`;
+          }
+          if (srv.cpus != null && srv.cpus.length > 0) {
+            cpuHtml += `<table class="table table-striped">
+              <thead>
+                <tr>
+                  <th>CPU Core</th>
+                  <th>Usage (%)</th>
+                  <th>Frequency (MHz)</th>
+                  <th>Status</th>
+                </tr>
+              </thead>
+              <tbody>`;
+            srv.cpus.forEach(cpu => {
+              cpuHtml += `<tr>
+                <td>${cpu.name}</td>
+                <td>${cpu.cpu_usage.toFixed(2)}</td>
+                <td>${cpu.frequency}</td>
+                <td><span class="text-${cpu.status}">${cpu.status == "red" ? "&#x26A0;" : "&#x2714;"}</span></td>
+              </tr>`;
+            });
+            cpuHtml += `</tbody></table>`;
+          } else {
+            cpuHtml += `<p class="text-danger">Unable to retrieve CPU usage data.</p>`;
+          }
+          cpuContent.innerHTML = cpuHtml;
+          cpuContent.style.display = (window.expandedStates[frontend.name] === 'cpu') ? 'block' : 'none';
+          cpuTabItem.appendChild(cpuContent);
+          tabGroup.appendChild(cpuTabItem);
+          
+          const memoryTabItem = document.createElement('div');
+          memoryTabItem.className = 'tab-item';
+          const memoryTab = document.createElement('div');
+          memoryTab.className = 'tab';
+          const memoryTabIcon = srv.memory_status === 'red'
+            ? '<span class="red">&#x26A0;</span>'
+            : '<span class="green">&#x2714;</span>';
+          memoryTab.innerHTML = `Memory Usage ${memoryTabIcon}`;
+          memoryTab.addEventListener('click', () => {
+            if (window.expandedStates[frontend.name] === 'memory') {
+              window.expandedStates[frontend.name] = 'open';
+              memoryContent.style.display = 'none';
+            } else {
+              window.expandedStates[frontend.name] = 'memory';
+              memoryContent.style.display = 'block';
+              diskContent.style.display = 'none';
+              cpuContent.style.display = 'none';
+            }
+          });
+          memoryTabItem.appendChild(memoryTab);
+          const memoryContent = document.createElement('div');
+          memoryContent.id = `memory-content-${frontend.name}`;
+          memoryContent.className = 'tab-content';
+          let memoryHtml = "";
+          if (srv.memory_usage != null) {
+            memoryHtml += `<p>Total Memory: ${srv.memory_usage.total_memory}</p>`;
+            memoryHtml += `<p>Used Memory: ${srv.memory_usage.used_memory}</p>`;
+            memoryHtml += `<p>Usage: ${srv.memory_usage.memory_percent.toFixed(2)}%</p>`;
+          } else {
+            memoryHtml += `<p class="text-danger">Unable to retrieve memory usage data.</p>`;
+          }
+          memoryContent.innerHTML = memoryHtml;
+          memoryContent.style.display = (window.expandedStates[frontend.name] === 'memory') ? 'block' : 'none';
+          memoryTabItem.appendChild(memoryContent);
+          tabGroup.appendChild(memoryTabItem);
         }
-        memoryContent.innerHTML = memoryHtml;
-        memoryContent.style.display = (window.expandedStates[frontend.name] === 'memory') ? 'block' : 'none';
-        memoryTabItem.appendChild(memoryContent);
-        tabGroup.appendChild(memoryTabItem);
         
         serverDiv.appendChild(tabGroup);
         container.appendChild(serverDiv);
       });
     }
-    
+
     async function refreshData() {
       try {
         const res = await fetch('/api/servers');
@@ -475,7 +525,7 @@ async fn index() -> impl Responder {
         console.error('Error fetching server data:', err);
       }
     }
-    
+
     async function addFrontend(event) {
       event.preventDefault();
       const formData = new FormData(document.getElementById('add-frontend-form'));
@@ -485,11 +535,11 @@ async fn index() -> impl Responder {
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
             name: formData.get('name'),
-            ip: formData.get('ip')
+            ip: formData.get('ip'),
+            type: formData.get('type')
           })
         });
         if (res.ok) {
-          // Clear the form inputs after successful addition.
           document.getElementById('add-frontend-form').reset();
           const modalEl = document.getElementById('addFrontendModal');
           const modal = bootstrap.Modal.getInstance(modalEl);
@@ -503,7 +553,7 @@ async fn index() -> impl Responder {
         showAlert('Error adding frontend: ' + err, 'danger');
       }
     }
-    
+
     async function deleteFrontend(name) {
       try {
         const res = await fetch('/delete_frontend', {
@@ -521,12 +571,12 @@ async fn index() -> impl Responder {
         showAlert('Error deleting frontend: ' + err, 'danger');
       }
     }
-    
+
     document.getElementById('addFrontendBtn').addEventListener('click', () => {
       new bootstrap.Modal(document.getElementById('addFrontendModal')).show();
     });
     document.getElementById('add-frontend-form').addEventListener('submit', addFrontend);
-    
+
     refreshData();
     setInterval(refreshData, 5000);
   </script>
@@ -563,7 +613,11 @@ async fn delete_frontend(form: web::Form<DeleteFrontend>) -> impl Responder {
 
 async fn send_slack_alert(message: &str) {
     if let Some(webhook) = &*SLACK_WEBHOOK {
-        let client = Client::new();
+		let client = Client::builder()
+			.timeout(Duration::from_secs(10))
+			.build()
+			.expect("Failed to build reqwest client");
+
         let payload = serde_json::json!({ "text": message });
         if let Err(e) = client.post(webhook).json(&payload).send().await {
             eprintln!("Error sending slack alert: {}", e);
@@ -574,111 +628,134 @@ async fn send_slack_alert(message: &str) {
 }
 
 async fn poll_frontends() {
-    let client = Client::new();
+	let client = Client::builder()
+		.timeout(Duration::from_secs(10))
+		.build()
+		.expect("Failed to build reqwest client");
+
     loop {
         let frontends = FRONTENDS.read().unwrap().clone();
-
         let new_usage_data: Vec<ServerUsage> = stream::iter(frontends.into_iter())
             .map(|fe| {
                 let client = client.clone();
                 async move {
-                    // Get current time in Thailand (UTC+7)
                     let crawl_time = Utc::now()
                         .with_timezone(&FixedOffset::east_opt(7 * 3600).unwrap())
                         .format("%Y-%m-%d %H:%M:%S")
                         .to_string();
-
-                    let url = format!("http://{}:8081/usage", fe.ip);
-                    let usage = match client.get(&url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            match resp.json::<SystemMetrics>().await {
-                                Ok(metrics) => {
-                                    let computed_disks: Vec<ComputedDiskUsage> =
-                                        metrics.disk_usage.into_iter().map(|d| {
-                                            ComputedDiskUsage {
-                                                mount_point: d.mount_point,
-                                                total: d.total,
-                                                used: d.used,
-                                                used_percent: d.used_percent,
-                                                status: if d.used_percent > 90.0 {
-                                                    "red".to_string()
-                                                } else {
-                                                    "green".to_string()
-                                                },
-                                            }
-                                        }).collect();
-                                    let computed_cpus: Vec<ComputedCpuInfo> =
-                                        metrics.cpus.into_iter().map(|c| {
-                                            ComputedCpuInfo {
-                                                name: c.name,
-                                                cpu_usage: c.cpu_usage,
-                                                frequency: c.frequency,
-                                                status: if c.cpu_usage > 90.0 {
-                                                    "red".to_string()
-                                                } else {
-                                                    "green".to_string()
-                                                },
-                                            }
-                                        }).collect();
-                                    let computed_memory = ComputedMemoryUsage {
-                                        total_memory: metrics.total_memory,
-                                        used_memory: metrics.used_memory,
-                                        memory_percent: metrics.memory_percent,
-                                        status: if metrics.memory_percent > 90.0 {
-                                            "red".to_string()
-                                        } else {
-                                            "green".to_string()
-                                        },
-                                    };
-                                    let disk_status = if computed_disks.iter().any(|d| d.status == "red") {
-                                        "red"
-                                    } else {
-                                        "green"
-                                    }.to_string();
-                                    let cpu_status = if metrics.cpu_usage > 90.0 {
-                                        "red"
-                                    } else {
-                                        "green"
-                                    }.to_string();
-                                    let memory_status = computed_memory.status.clone();
-                                    let overall_status = if disk_status == "red" || cpu_status == "red" || memory_status == "red" {
-                                        "red"
-                                    } else {
-                                        "green"
-                                    }.to_string();
-                                    ServerUsage {
-                                        frontend: fe.clone(),
-                                        disk_usage: Some(computed_disks),
-                                        cpu_usage: Some(metrics.cpu_usage),
-                                        cpus: Some(computed_cpus),
-                                        memory_usage: Some(computed_memory),
-                                        disk_status,
-                                        cpu_status,
-                                        memory_status,
-                                        overall_status,
-                                        crawl_time: crawl_time.clone(),
-                                    }
-                                },
-                                Err(err) => {
-                                    eprintln!("Failed to parse JSON for {}: {}", fe.name, err);
-                                    ServerUsage {
-                                        frontend: fe.clone(),
-                                        disk_usage: None,
-                                        cpu_usage: None,
-                                        cpus: None,
-                                        memory_usage: None,
-                                        disk_status: "red".to_string(),
-                                        cpu_status: "red".to_string(),
-                                        memory_status: "red".to_string(),
-                                        overall_status: "red".to_string(),
-                                        crawl_time: crawl_time.clone(),
+                    
+                    if fe.frontend_type.to_lowercase() == "server" {
+                        let url = format!("http://{}:8081/usage", fe.ip);
+                        let usage = match client.get(&url).send().await {
+                            Ok(resp) if resp.status().is_success() => {
+                                match resp.json::<SystemMetrics>().await {
+                                    Ok(metrics) => {
+                                        let computed_disks: Vec<ComputedDiskUsage> =
+                                            metrics.disk_usage.into_iter().map(|d| {
+                                                ComputedDiskUsage {
+                                                    mount_point: d.mount_point,
+                                                    total: d.total,
+                                                    used: d.used,
+                                                    used_percent: d.used_percent,
+                                                    status: if d.used_percent > 90.0 { "red".to_string() } else { "green".to_string() },
+                                                }
+                                            }).collect();
+                                        let computed_cpus: Vec<ComputedCpuInfo> =
+                                            metrics.cpus.into_iter().map(|c| {
+                                                ComputedCpuInfo {
+                                                    name: c.name,
+                                                    cpu_usage: c.cpu_usage,
+                                                    frequency: c.frequency,
+                                                    status: if c.cpu_usage > 90.0 { "red".to_string() } else { "green".to_string() },
+                                                }
+                                            }).collect();
+                                        let computed_memory = ComputedMemoryUsage {
+                                            total_memory: metrics.total_memory,
+                                            used_memory: metrics.used_memory,
+                                            memory_percent: metrics.memory_percent,
+                                            status: if metrics.memory_percent > 90.0 { "red".to_string() } else { "green".to_string() },
+                                        };
+                                        let disk_status = if computed_disks.iter().any(|d| d.status == "red") { "red" } else { "green" }.to_string();
+                                        let cpu_status = if metrics.cpu_usage > 90.0 { "red" } else { "green" }.to_string();
+                                        let memory_status = computed_memory.status.clone();
+                                        let overall_status = if disk_status == "red" || cpu_status == "red" || memory_status == "red" { "red" } else { "green" }.to_string();
+                                        
+                                        // Build a vector of red-status keys dynamically.
+                                        let status_keys = vec![
+                                            ("disk_status", disk_status.as_str()),
+                                            ("cpu_status", cpu_status.as_str()),
+                                            ("memory_status", memory_status.as_str()),
+                                            ("overall_status", overall_status.as_str()),
+                                        ];
+                                        let red_keys: Vec<&str> = status_keys.into_iter()
+                                            .filter_map(|(k, v)| if v == "red" { Some(k) } else { None })
+                                            .collect();
+                                        if *SLACK_ALERT_ENABLED && !red_keys.is_empty() {
+                                            let red_keys_str = red_keys.join(", ");
+                                            let alert_message = format!("Alert for {}: statuses [{}] are red at {}", fe.name, red_keys_str, crawl_time);
+                                            send_slack_alert(&alert_message).await;
+                                        }
+                                        
+                                        ServerUsage {
+                                            frontend: fe.clone(),
+                                            disk_usage: Some(computed_disks),
+                                            cpu_usage: Some(metrics.cpu_usage),
+                                            cpus: Some(computed_cpus),
+                                            memory_usage: Some(computed_memory),
+                                            disk_status,
+                                            cpu_status,
+                                            memory_status,
+                                            overall_status,
+                                            connectivity: "green".to_string(),
+                                            crawl_time: crawl_time.clone(),
+                                            status_history: None,
+                                        }
+                                    },
+                                    Err(err) => {
+                                        eprintln!("Failed to parse JSON for {}: {}", fe.name, err);
+                                        if *SLACK_ALERT_ENABLED {
+                                            let alert_message = format!("Alert for {}: Failed to parse JSON response at {}. Error: {}", fe.name, crawl_time, err);
+                                            send_slack_alert(&alert_message).await;
+                                        }
+                                        ServerUsage {
+                                            frontend: fe.clone(),
+                                            disk_usage: None,
+                                            cpu_usage: None,
+                                            cpus: None,
+                                            memory_usage: None,
+                                            disk_status: "red".to_string(),
+                                            cpu_status: "red".to_string(),
+                                            memory_status: "red".to_string(),
+                                            overall_status: "red".to_string(),
+                                            connectivity: "green".to_string(),
+                                            crawl_time: crawl_time.clone(),
+                                            status_history: None,
+                                        }
                                     }
                                 }
-                            }
-                        },
-                        Err(err) => {
-                            eprintln!("Error contacting frontend {}: {}", fe.name, err);
-                            ServerUsage {
+                            },
+                            Err(err) => {
+                                eprintln!("Error contacting frontend {}: {}", fe.name, err);
+                                if *SLACK_ALERT_ENABLED {
+                                    let alert_message = format!("Connectivity error for {}: Unable to reach at {}. Error: {}", fe.name, crawl_time, err);
+                                    send_slack_alert(&alert_message).await;
+                                }
+                                ServerUsage {
+                                    frontend: fe.clone(),
+                                    disk_usage: None,
+                                    cpu_usage: None,
+                                    cpus: None,
+                                    memory_usage: None,
+                                    disk_status: "red".to_string(),
+                                    cpu_status: "red".to_string(),
+                                    memory_status: "red".to_string(),
+                                    overall_status: "red".to_string(),
+                                    connectivity: "red".to_string(),
+                                    crawl_time: crawl_time.clone(),
+                                    status_history: None,
+                                }
+                            },
+                            _ => ServerUsage {
                                 frontend: fe.clone(),
                                 disk_usage: None,
                                 cpu_usage: None,
@@ -688,10 +765,60 @@ async fn poll_frontends() {
                                 cpu_status: "red".to_string(),
                                 memory_status: "red".to_string(),
                                 overall_status: "red".to_string(),
+                                connectivity: "red".to_string(),
                                 crawl_time: crawl_time.clone(),
+                                status_history: None,
                             }
-                        },
-                        _ => ServerUsage {
+                        };
+                        usage
+                    } else if fe.frontend_type.to_lowercase() == "website" {
+                        let url = if fe.ip.starts_with("http://") || fe.ip.starts_with("https://") {
+                            fe.ip.clone()
+                        } else {
+                            format!("http://{}", fe.ip)
+                        };
+                        let website_status_code = match client.get(&url).send().await {
+                            Ok(resp) => resp.status().as_u16(),
+                            Err(err) => {
+                                eprintln!("Error contacting website {}: {}", fe.name, err);
+                                0
+                            }
+                        };
+                        let website_status = if website_status_code == 200 { "green".to_string() } else { "red".to_string() };
+                        let connectivity = if website_status_code != 0 { "green".to_string() } else { "red".to_string() };
+                        let status_record = StatusRecord {
+                            status_code: website_status_code,
+                            crawl_time: crawl_time.clone(),
+                        };
+                        {
+                            let mut history_map = WEBSITE_HISTORY.write().unwrap();
+                            let history_vec = history_map.entry(fe.name.clone()).or_insert(vec![]);
+                            history_vec.push(status_record.clone());
+                            if history_vec.len() > 3 {
+                                history_vec.remove(0);
+                            }
+                        }
+                        let history = WEBSITE_HISTORY.read().unwrap().get(&fe.name).cloned();
+                        if *SLACK_ALERT_ENABLED && website_status == "red" {
+                            let alert_message = format!("Alert for {}: website returned status {} at {}", fe.name, website_status_code, crawl_time);
+                            send_slack_alert(&alert_message).await;
+                        }
+                        ServerUsage {
+                            frontend: fe.clone(),
+                            disk_usage: None,
+                            cpu_usage: None,
+                            cpus: None,
+                            memory_usage: None,
+                            disk_status: website_status.clone(),
+                            cpu_status: website_status.clone(),
+                            memory_status: website_status.clone(),
+                            overall_status: website_status.clone(),
+                            connectivity,
+                            crawl_time: crawl_time.clone(),
+                            status_history: history,
+                        }
+                    } else {
+                        ServerUsage {
                             frontend: fe.clone(),
                             disk_usage: None,
                             cpu_usage: None,
@@ -701,39 +828,16 @@ async fn poll_frontends() {
                             cpu_status: "red".to_string(),
                             memory_status: "red".to_string(),
                             overall_status: "red".to_string(),
+                            connectivity: "red".to_string(),
                             crawl_time: crawl_time.clone(),
-                        }
-                    };
-
-                    // Dynamically check every key ending with "_status" in the usage struct.
-                    let usage_value = serde_json::to_value(&usage).unwrap();
-                    let mut red_keys = Vec::new();
-                    if let Some(map) = usage_value.as_object() {
-                        for (key, value) in map.iter() {
-                            if key.ends_with("_status") {
-                                if let Some(status) = value.as_str() {
-                                    if status == "red" {
-                                        red_keys.push(key.to_string());
-                                    }
-                                }
-                            }
+                            status_history: None,
                         }
                     }
-                    if *SLACK_ALERT_ENABLED && !red_keys.is_empty() {
-                        let keys_str = red_keys.join(", ");
-                        let alert_message = format!(
-                            "Alert for {}: statuses [{}] are red at {}",
-                            fe.name, keys_str, crawl_time
-                        );
-                        send_slack_alert(&alert_message).await;
-                    }
-                    usage
                 }
             })
             .buffered(100)
             .collect()
             .await;
-
         {
             let mut usage_data = USAGE_DATA.write().unwrap();
             *usage_data = new_usage_data;
@@ -744,7 +848,7 @@ async fn poll_frontends() {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    dotenv().ok(); // Load .env variables
+    dotenv().ok();
     tokio::spawn(async {
         poll_frontends().await;
     });
