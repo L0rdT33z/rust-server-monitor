@@ -4,7 +4,7 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 
 ## Features
 
-- **Concurrent Polling:** Uses asynchronous Rust features and stream combinators (e.g., `buffer_unordered`) to poll thousands of servers concurrently.
+- **Concurrent Polling:** Uses asynchronous Rust features and stream combinators to poll thousands of servers concurrently.
 - **Real-Time Dashboard:** Displays detailed server metrics using a web dashboard built with Bootstrap 5.
 - **Robust Error Handling:** Gracefully handles unresponsive or misbehaving servers.
 - **Extensible:** Easily configurable to monitor additional metrics or integrate with other systems.
