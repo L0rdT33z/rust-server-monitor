@@ -12,7 +12,9 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 ## Requirements
 
 - [Rust](https://www.rust-lang.org/tools/install) (stable, with Cargo)
+
 - [PM2](https://pm2.keymetrics.io/) (optional, for process management)
+
 - A configured `frontends.json` file containing an array of server objects:
   
   ```json
@@ -25,6 +27,14 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 ## Installation
 
 ```
+sudo su -
+# Install Initial Package
+sudo apt update && sudo apt upgrade
+sudo apt install pkg-config libssl-dev
+sudo apt install build-essential
+# Install rust
+curl --proto '=https' --tlsv1.3 https://sh.rustup.rs -sSf | sh
+source $HOME/.cargo/env
 # Clone the Repository:
 git clone git@github.com:L0rdT33z/rust-server-monitor.git
 cd rust-server-monitor
@@ -57,6 +67,7 @@ PM2 is a process manager that can help you keep the application running continuo
 0. **Install NodeJS & NPM:**
 
 ```bash
+mv /home/ubuntu/rust-server-monitor-main/ .
 sudo su -
 cd ~
 curl -sL https://deb.nodesource.com/setup_16.x -o /tmp/nodesource_setup.sh
@@ -72,23 +83,13 @@ sudo apt install nodejs
    npm install -g pm2
    ```
 
-2. **Clone the Repository:**
-   
-   ```
-   # Clone the Repository:
-   git clone git@github.com:L0rdT33z/rust-server-monitor.git
-   cd rust-server-monitor
-   ```
-
-# Build the Project in Release Mode:
-
-   cargo build --release
-
-```
 2. **Start Your Rust Application with PM2:**
 
-   ```bash
-   pm2 start ./target/release/rust-server-monitor --name rust-server-monitor
+```bash
+# For Frontend
+pm2 start ./target/release/frontend --name rust-server-monitor-agent
+ #For Backend
+pm2 start ./target/release/backend --name rust-server-monitor-backend
 ```
 
 3. **Set Up PM2 to Run on System Startup:** PM2 provides a startup script that will configure your system to resurrect your processes on boot.
@@ -114,19 +115,19 @@ sudo apt install nodejs
    - **View Logs:**
      
      ```bash
-     pm2 logs rust-server-monitor
+     pm2 logs rust-server-monitor-backend
      ```
    
    - **Stop the Process:**
      
      ```bash
-     pm2 stop rust-server-monitor
+     pm2 stop rust-server-monitor-backend
      ```
    
    - **Restart the Process:**
      
      ```bash
-     pm2 restart rust-server-monitor
+     pm2 restart rust-server-monitor-backend
      ```
    
    - **List All Processes:**
