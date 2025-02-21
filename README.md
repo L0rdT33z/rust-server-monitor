@@ -14,7 +14,7 @@ A high-performance server monitoring tool written in Rust using Actix-web. It co
 - [Rust](https://www.rust-lang.org/tools/install) (stable, with Cargo)
 - [PM2](https://pm2.keymetrics.io/) (optional, for process management)
 - A configured `frontends.json` file containing an array of server objects:
-  ```json
+```json
   [
       { "name": "Server1", "ip": "192.168.1.100" },
       { "name": "Server2", "ip": "192.168.1.101" }
