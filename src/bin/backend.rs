@@ -3,6 +3,7 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::{
+    env,
     fs::File,
     io::{Read, Write},
     sync::RwLock,
@@ -11,6 +12,8 @@ use std::{
 use tokio::time;
 use futures::stream::{self, StreamExt};
 use chrono::{Utc, FixedOffset};
+use dotenv::dotenv;
+use serde_json;
 
 const FRONTENDS_FILE: &str = "frontends.json";
 
@@ -89,7 +92,7 @@ struct ServerUsage {
     cpus: Option<Vec<ComputedCpuInfo>>,
     memory_usage: Option<ComputedMemoryUsage>,
     disk_status: String,    // "red" if any disk is red, else "green"
-    cpu_status: String,     // "red" if global CPU usage > 70, else "green"
+    cpu_status: String,     // "red" if global CPU usage > 90, else "green"
     memory_status: String,  // "red" if memory usage > 70, else "green"
     overall_status: String, // "red" if any of the statuses is red, else "green"
     crawl_time: String,     // crawl time in Thailand time (UTC+7)
@@ -101,6 +104,14 @@ static FRONTENDS: Lazy<RwLock<Vec<FrontendInfo>>> = Lazy::new(|| {
     RwLock::new(frontends)
 });
 static USAGE_DATA: Lazy<RwLock<Vec<ServerUsage>>> = Lazy::new(|| RwLock::new(vec![]));
+
+// Global environment variables for Slack.
+static SLACK_WEBHOOK: Lazy<Option<String>> = Lazy::new(|| {
+    env::var("SLACK_WEBHOOK").ok()
+});
+static SLACK_ALERT_ENABLED: Lazy<bool> = Lazy::new(|| {
+    env::var("SLACK_ALERT").map(|val| val.to_lowercase() == "true").unwrap_or(false)
+});
 
 fn load_frontends() -> std::io::Result<Vec<FrontendInfo>> {
     let mut file = File::open(FRONTENDS_FILE)?;
@@ -382,7 +393,7 @@ async fn index() -> impl Responder {
         cpuContent.id = `cpu-content-${frontend.name}`;
         cpuContent.className = 'tab-content';
         let cpuHtml = "";
-        if (srv.cpu_usage !== undefined && srv.cpu_usage !== null) {
+        if (srv.cpu_usage != null) {
           cpuHtml += `<p>Global CPU Usage: ${srv.cpu_usage.toFixed(2)}%</p>`;
         }
         if (srv.cpus && srv.cpus.length > 0) {
@@ -550,6 +561,18 @@ async fn delete_frontend(form: web::Form<DeleteFrontend>) -> impl Responder {
     HttpResponse::Ok().body("Deleted")
 }
 
+async fn send_slack_alert(message: &str) {
+    if let Some(webhook) = &*SLACK_WEBHOOK {
+        let client = Client::new();
+        let payload = serde_json::json!({ "text": message });
+        if let Err(e) = client.post(webhook).json(&payload).send().await {
+            eprintln!("Error sending slack alert: {}", e);
+        }
+    } else {
+        eprintln!("Slack webhook not set");
+    }
+}
+
 async fn poll_frontends() {
     let client = Client::new();
     loop {
@@ -681,6 +704,29 @@ async fn poll_frontends() {
                             crawl_time: crawl_time.clone(),
                         }
                     };
+
+                    // Dynamically check every key ending with "_status" in the usage struct.
+                    let usage_value = serde_json::to_value(&usage).unwrap();
+                    let mut red_keys = Vec::new();
+                    if let Some(map) = usage_value.as_object() {
+                        for (key, value) in map.iter() {
+                            if key.ends_with("_status") {
+                                if let Some(status) = value.as_str() {
+                                    if status == "red" {
+                                        red_keys.push(key.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if *SLACK_ALERT_ENABLED && !red_keys.is_empty() {
+                        let keys_str = red_keys.join(", ");
+                        let alert_message = format!(
+                            "Alert for {}: statuses [{}] are red at {}",
+                            fe.name, keys_str, crawl_time
+                        );
+                        send_slack_alert(&alert_message).await;
+                    }
                     usage
                 }
             })
@@ -698,6 +744,7 @@ async fn poll_frontends() {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
+    dotenv().ok(); // Load .env variables
     tokio::spawn(async {
         poll_frontends().await;
     });
