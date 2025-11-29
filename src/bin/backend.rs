@@ -518,7 +518,7 @@ async fn index() -> impl Responder {
 
     async function refreshData() {
       try {
-        const res = await fetch('/api/servers');
+        const res = await fetch('./api/servers');
         const data = await res.json();
         renderServers(data);
       } catch (err) {
@@ -530,7 +530,7 @@ async fn index() -> impl Responder {
       event.preventDefault();
       const formData = new FormData(document.getElementById('add-frontend-form'));
       try {
-        const res = await fetch('/add_frontend', {
+        const res = await fetch('./add_frontend', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({
@@ -556,7 +556,7 @@ async fn index() -> impl Responder {
 
     async function deleteFrontend(name) {
       try {
-        const res = await fetch('/delete_frontend', {
+        const res = await fetch('./delete_frontend', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
           body: new URLSearchParams({ name })
