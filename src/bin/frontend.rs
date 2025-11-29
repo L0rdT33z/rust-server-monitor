@@ -87,7 +87,7 @@ async fn main() -> std::io::Result<()> {
     HttpServer::new(|| {
         App::new().service(get_disk_usage)
     })
-    .bind(("0.0.0.0", 8081))?
+    .bind(("127.0.0.1", 8081))?
     .run()
     .await
 }
