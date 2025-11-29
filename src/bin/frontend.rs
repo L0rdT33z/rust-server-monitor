@@ -83,7 +83,7 @@ async fn get_disk_usage() -> impl Responder {
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
-    println!("Frontend agent running on http://0.0.0.0:8081");
+    println!("Frontend agent running on http://127.0.0.1:8081");
     HttpServer::new(|| {
         App::new().service(get_disk_usage)
     })
