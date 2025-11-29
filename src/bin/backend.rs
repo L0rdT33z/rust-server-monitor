@@ -645,7 +645,7 @@ async fn poll_frontends() {
                         .to_string();
                     
                     if fe.frontend_type.to_lowercase() == "server" {
-                        let url = format!("http://{}:8081/usage", fe.ip);
+                        let url = format!("{}", fe.ip);
                         let usage = match client.get(&url).send().await {
                             Ok(resp) if resp.status().is_success() => {
                                 match resp.json::<SystemMetrics>().await {
@@ -852,7 +852,7 @@ async fn main() -> std::io::Result<()> {
     tokio::spawn(async {
         poll_frontends().await;
     });
-    println!("Backend server running on http://0.0.0.0:8080");
+    println!("Backend server running on http://127.0.0.1:8080");
     HttpServer::new(|| {
         App::new()
             .service(index)
@@ -860,7 +860,7 @@ async fn main() -> std::io::Result<()> {
             .service(add_frontend)
             .service(delete_frontend)
     })
-    .bind(("0.0.0.0", 8080))?
+    .bind(("127.0.0.1", 8080))?
     .run()
     .await
 }
